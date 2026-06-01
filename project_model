@@ -1,0 +1,448 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random as rn
+import os
+import math
+import warnings
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+
+try: #코랩이면 구글드라이브 연결
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=True)
+    DATA_DIR = "/content/drive/MyDrive/Colab Notebooks/"
+except:
+    DATA_DIR = "./data"
+
+# 비대칭 가중 손실함수
+#실제값>예측값 즉 전력을 실제보다 적게 쓸거라고 과소 예측 했을 때 실수를 과대 예측보다 3배 아프게 0받아들임.
+#과대예측은 전기가 남아서 버리는 비용이 발생하지만 계통이 안전하지만 과소 예측은 전기가 모자라 블랙아웃(대정전)이 발생할 위험이 있으므로 보수적으로 설계
+class AsymmetricWeightedMSE(nn.Module):
+    def __init__(self, alpha=3.0):
+        super(AsymmetricWeightedMSE, self).__init__()
+        self.alpha = alpha # 실제보다 적게 예측했을 때(과소 예측) 부여할 패널티 가중치
+
+    def forward(self, pred, target):
+        error = target - pred
+        # 실제값(target) > 예측값(pred) 즉, error > 0 인 상황(과소예측)에는 alpha(3배)를 곱함
+        loss = torch.where(error > 0, self.alpha * (error**2), error**2)
+        return torch.mean(loss)
+
+# 성능 평가를 위한 sMAPE 함수
+def calculate_smape(gt, preds):
+    gt = np.array(gt)
+    preds = np.array(preds)
+    # 분모가 0이 되는 것을 방지하기 위해 미세한 값(1e-8)을 더해주면 더 안정적입니다.
+    v = 2 * np.abs(preds - gt) / (np.abs(preds) + np.abs(gt) + 1e-8)
+    score = np.mean(v) * 100
+    return score
+
+# ---------------------------------------------------------
+# 데이터 전처리 파이프라인 함수 (Preprocessing)
+# ---------------------------------------------------------
+def preprocessing():
+
+    jeju = pd.read_csv(f'{DATA_DIR}/jeju.csv', encoding='cp949')   
+    train = pd.read_csv(f'{DATA_DIR}/train.csv', encoding='utf-8')  
+    test = pd.read_csv(f'{DATA_DIR}/test.csv', encoding='utf-8')    
+    building_info = pd.read_csv(f'{DATA_DIR}/building_info.csv', encoding='utf-8') 
+
+    #컬럼명을 영문으로 변경
+    jeju = jeju.rename(columns={
+        '일시': 'date_time',
+        '기온': 'temperature',
+        '습도': 'humidity',
+        '일사량': 'solar_radiation',
+        '태양광 발전량(MWh)': 'power_consumption' 
+    })
+
+    train = train.rename(columns={
+        '건물번호': 'building_number',
+        '일시': 'date_time',
+        '기온(°C)': 'temperature',
+        '강수량(mm)': 'rainfall',
+        '풍속(m/s)': 'windspeed',
+        '습도(%)': 'humidity',
+        '일조(hr)': 'sunshine',
+        '일사(MJ/m2)': 'solar_radiation',
+        '전력소비량(kWh)': 'power_consumption'
+    })
+    train.drop('num_date_time', axis = 1, inplace=True)
+
+    test = test.rename(columns={
+        '건물번호': 'building_number',
+        '일시': 'date_time',
+        '기온(°C)': 'temperature',
+        '강수량(mm)': 'rainfall',
+        '풍속(m/s)': 'windspeed',
+        '습도(%)': 'humidity',
+        '일조(hr)': 'sunshine',
+        '일사(MJ/m2)': 'solar_radiation',
+        '전력소비량(kWh)': 'power_consumption'
+    })
+    test.drop('num_date_time', axis = 1, inplace=True)
+
+    building_info = building_info.rename(columns={
+        '건물번호': 'building_number',
+        '건물유형': 'building_type',
+        '연면적(m2)': 'total_area',
+        '냉방면적(m2)': 'cooling_area',
+        '태양광용량(kW)': 'solar_power_capacity',
+        'ESS저장용량(kWh)': 'ess_capacity',
+        'PCS용량(kW)': 'pcs_capacity'
+    })
+
+    translation_dict = {
+        '건물기타': 'Other Buildings',
+        '공공': 'Public',
+        '학교': 'University',
+        '백화점': 'Department Store',
+        '병원': 'Hospital',
+        '상용': 'Commercial',
+        '아파트': 'Apartment',
+        '연구소': 'Research Institute',
+        'IDC(전화국)': 'IDC',
+        '호텔': 'Hotel'
+    }
+
+    #translation_dict(한글->영문 딕셔너리)로 한글 데이터를 영어로 일괄 변경
+    building_info['building_type'] = building_info['building_type'].replace(translation_dict)
+
+    # '-' 값을 0으로 변환하고 숫자형으로 변경
+    building_info['solar_power_capacity'] = building_info['solar_power_capacity'].replace('-', 0).astype(float)
+    building_info['ess_capacity'] = building_info['ess_capacity'].replace('-', 0).astype(float)
+
+    # 태양광 및 ESS 설치여부 이진변수 생성 (np.where)
+    building_info['solar_flag'] = np.where(building_info['solar_power_capacity'] > 0, 1, 0)
+    building_info['ess_flag'] = np.where(building_info['ess_capacity'] > 0, 1, 0)
+
+    # building_info를 전력사용량 데이터 왼쪽에 조인
+    train = pd.merge(train, building_info, on='building_number', how='left')
+    test = pd.merge(test, building_info, on='building_number', how='left')
+
+    # Outlier 제거 - 데이터 정제 (전력소비량이 0인 행 삭제)
+    initial_rows = len(train)
+    outlier_idx = train.index[train['power_consumption'] == 0].tolist()
+    train.drop(index=outlier_idx, inplace=True)
+    deleted_rows = initial_rows - len(train)
+    print(f"[데이터 정제 결과]: 총 {deleted_rows}개의 행이 삭제되었습니다.")
+
+    # 시간 데이터 수치화 및 datetime 변환
+    jeju['date_time'] = pd.to_datetime(jeju['date_time'], format='%Y-%m-%d %I:%M:%S %p', errors='coerce')
+    jeju['month'] = jeju['date_time'].dt.month
+    jeju['hour'] = jeju['date_time'].dt.hour
+    jeju['day'] = jeju['date_time'].dt.day   
+    jeju['day_of_week'] = jeju['date_time'].dt.dayofweek
+
+    train['date_time'] = pd.to_datetime(train['date_time'], format='%Y%m%d %H', errors='coerce')
+    train['month'] = train['date_time'].dt.month
+    train['hour'] = train['date_time'].dt.hour
+    train['day'] = train['date_time'].dt.day        
+    train['day_of_week'] = train['date_time'].dt.dayofweek 
+
+    test['date_time'] = pd.to_datetime(test['date_time'], format='%Y%m%d %H', errors='coerce')
+    test['hour'] = test['date_time'].dt.hour
+    test['day'] = test['date_time'].dt.day
+    test['month'] = test['date_time'].dt.month
+    test['day_of_week'] = test['date_time'].dt.dayofweek
+
+    # 2024년 공휴일 반영 및 휴일 변수 부여
+    # (토요일, 일요일이거나 지정된 공휴일이면 1, 평일이면 0)
+    holi_weekday = ['2024-06-06', '2024-08-15']
+    train['holiday'] = np.where((train.day_of_week >= 5) | (train.date_time.dt.strftime('%Y-%m-%d').isin(holi_weekday)), 1, 0)
+    test['holiday'] = np.where((test.day_of_week >= 5) | (test.date_time.dt.strftime('%Y-%m-%d').isin(holi_weekday)), 1, 0)
+
+    #시간 데이터 순환인코딩 : 시간,월,요일은 끝과 시작이 연속되는 순환구조이므로 이를 해결하기 위해 푸리에 변환의 원리를 이용한 sin/cos 변환을 수행
+    #hour는 24시간 주기, dayofweek은 7일 주기, month와 date는 12개월 1년 주기
+    jeju['sin_hour'] = np.sin(2 * np.pi * jeju['hour']/23.0)
+    jeju['cos_hour'] = np.cos(2 * np.pi * jeju['hour']/23.0)
+    jeju['sin_month'] = -np.sin(2 * np.pi * jeju['month']/12.0)
+    jeju['cos_month'] = -np.cos(2 * np.pi * jeju['month']/12.0)
+
+    train['sin_hour'] = np.sin(2 * np.pi * train['hour']/23.0)
+    train['cos_hour'] = np.cos(2 * np.pi * train['hour']/23.0)
+    test['sin_hour'] = np.sin(2 * np.pi * test['hour']/23.0)
+    test['cos_hour'] = np.cos(2 * np.pi * test['hour']/23.0)
+
+    train['sin_date'] = -np.sin(2 * np.pi * (train['month']+train['day']/31)/12)
+    train['cos_date'] = -np.cos(2 * np.pi * (train['month']+train['day']/31)/12)
+    test['sin_date'] = -np.sin(2 * np.pi * (test['month']+test['day']/31)/12)
+    test['cos_date'] = -np.cos(2 * np.pi * (test['month']+test['day']/31)/12)
+
+    train['sin_month'] = -np.sin(2 * np.pi * train['month']/12.0)
+    train['cos_month'] = -np.cos(2 * np.pi * train['month']/12.0)
+    test['sin_month'] = -np.sin(2 * np.pi * test['month']/12.0)
+    test['cos_month'] = -np.cos(2 * np.pi * test['month']/12.0)
+
+    train['sin_dayofweek'] = -np.sin(2 * np.pi * (train['day_of_week']+1)/7.0)
+    train['cos_dayofweek'] = -np.cos(2 * np.pi * (train['day_of_week']+1)/7.0)
+    test['sin_dayofweek'] = -np.sin(2 * np.pi * (test['day_of_week']+1)/7.0)
+    test['cos_dayofweek'] = -np.cos(2 * np.pi * (test['day_of_week']+1)/7.0)
+
+    # 여름철 전력피크기간(6.1~9.14, 약 106일) 별도 주기 설정
+    # 'summer' 변수가 정의되지 않았으므로, 항상 실행되도록 수정합니다.
+    def summer_cos(date):
+        start_date = datetime.strptime("2024-06-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        end_date = datetime.strptime("2024-09-14 00:00:00", "%Y-%m-%d %H:%M:%S")
+
+        period = (end_date - start_date).total_seconds()
+
+        return math.cos(2 * math.pi * (date - start_date).total_seconds() / period)
+
+    def summer_sin(date):
+        start_date = datetime.strptime("2024-06-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        end_date = datetime.strptime("2024-09-14 00:00:00", "%Y-%m-%d %H:%M:%S")
+
+        period = (end_date - start_date).total_seconds()
+
+        return math.sin(2 * math.pi * (date - start_date).total_seconds() / period)
+
+    train['summer_cos'] = train['date_time'].apply(summer_cos)
+    train['summer_sin'] = train['date_time'].apply(summer_sin)
+
+    test['summer_cos'] = test['date_time'].apply(summer_cos)
+    test['summer_sin'] = test['date_time'].apply(summer_sin)
+
+    #냉방도일 CDH: 열이 건물에 축적되는 효과를 수치화한 것 - 기온에서 기준 온도(26도)를 뺀 값을 11시간 동안 누적함
+    #현재 기온이 같더라도 지난 11시간 동안 계속 더웠다면 에어컨 사용량이 많아지기 때문
+    def CDH(xs):
+        cumsum = np.cumsum(xs - 26)
+        return np.concatenate((cumsum[:11], cumsum[11:] - cumsum[:-11]))
+
+    def calculate_and_add_cdh(dataframe):
+        cdhs = []
+        for i in range(1, 101):
+            temp = dataframe[dataframe['building_number'] == i]['temperature'].values
+            cdh = CDH(temp)
+            cdhs.append(cdh)
+        return np.concatenate(cdhs)
+
+    train['CDH'] = calculate_and_add_cdh(train)
+    test['CDH'] = calculate_and_add_cdh(test)
+
+    #불쾌지수 THI: 사람이 느끼는 실질적인 더위를 반영
+    #습도가 높으면 체감 온도가 올라가 냉방 수요가 급증함. 단순 기온보다 불쾌지수가 전력 부하 예측에 훨씬 정확한 지표로 쓰임
+    train['THI'] = 9/5*train['temperature'] - 0.55*(1-train['humidity']/100)*(9/5*train['humidity']-26)+32
+    test['THI'] = 9/5*test['temperature'] - 0.55*(1-test['humidity']/100)*(9/5*test['humidity']-26)+32
+
+    #체감온도 WCT: 기온에 풍속의 영향을 더한 지수
+    #강한 바람은 건물의 외벽을 식히거나 사람이 느끼는 온도를 변화시킴
+    train['WCT'] = 13.12 + 0.6125*train['temperature'] - 11.37*(train['windspeed']**
+                                                                0.16) + 0.3965*(train['windspeed']**0.16)*train['temperature']
+    test['WCT'] = 13.12 + 0.6125*test['temperature'] - 11.37*(test['windspeed']**
+                                                                0.16) + 0.3965*(test['windspeed']**0.16)*test['temperature']
+
+    # 타겟 통계량 추출 (pivot_table 활용한 건물별/요일별/시간별 소비 습관 패턴 계산)
+    power_pivot = train.pivot_table(
+        index=['building_number', 'day_of_week', 'hour'],
+        values='power_consumption', # Use 'power_consumption' as target
+        aggfunc=['mean', 'std']
+    ).reset_index()
+    power_pivot.columns = ['building_number', 'day_of_week', 'hour', 'building_mean', 'building_std']
+
+    # 데이터 통합 (평소 습관 병합)
+    train = pd.merge(train, power_pivot, on=['building_number', 'day_of_week', 'hour'], how='left')
+    test = pd.merge(test, power_pivot, on=['building_number', 'day_of_week', 'hour'], how='left')
+
+    return jeju, train, test
+
+# ---------------------------------------------------------
+# 2단계 MLP 모델 구조 정의 (solar_power_forecast MLP모델: 태양광발전량 예측)
+# ---------------------------------------------------------
+class SolarPowerForecast(nn.Module):
+    def __init__(self, weather_time_dim=7, hidden_dim=64):
+        super(SolarPowerForecast, self).__init__()
+        # Stage A: 기상/시간 -> 일사량 예측
+        self.model_a = nn.Sequential(
+            nn.Linear(weather_time_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        # Stage B: 일사량 -> 발전량 변환
+        self.model_b = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, x_weather_time):
+        predicted_irradiance = self.model_a(x_weather_time)
+        predicted_generation = self.model_b(predicted_irradiance)
+        return predicted_generation, predicted_irradiance
+
+# ---------------------------------------------------------
+# 전력 수요 예측 모델 정의 (TimesFM 전력수요 예측)
+# ---------------------------------------------------------
+class DemandForecastModel(nn.Module):
+    def __init__(self, input_dim=12, hidden_dim=64):
+        super(DemandForecastModel, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 1) # 최종 전력 수요 출력
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# 1. 실전 데이터 전처리 실행 및 테스트셋 확보
+jeju, train, test = preprocessing()
+print(jeju.head(10))
+print(train.head(10))
+print(test.head(10))
+
+solar_features = ['temperature', 'humidity', 'sin_hour', 'cos_hour', 'sin_month', 'cos_month']
+    
+demand_features = [
+        'temperature', 'humidity', 'windspeed', 'THI', 'CDH', 'WCT', 
+        'sin_hour', 'cos_hour', 'sin_dayofweek', 'cos_dayofweek', 
+        'building_mean', 'building_std'
+]
+
+
+criterion_mse = nn.MSELoss() # MSE "실제 정답이랑 예측값이 이만큼이나 틀렸어"라고 수치로 계산해 주는 역할
+
+# ─────────────────────────────────────────────────────────
+# [STAGE 1] 태양광 모델 제주 데이터 선학습 (Pre-training)
+# ─────────────────────────────────────────────────────────
+print("\n [STAGE 1] 태양광 모델 제주 데이터 선학습 시작...")
+solar_model = SolarPowerForecast(weather_time_dim=6, hidden_dim=64)
+X_jeju = torch.tensor(jeju[solar_features].values, dtype=torch.float32)
+y_jeju_rad = torch.tensor(jeju['solar_radiation'].values, dtype=torch.float32).unsqueeze(1)  
+y_jeju_gen = torch.tensor(jeju['power_consumption'].values, dtype=torch.float32).unsqueeze(1)
+
+opt_solar_pre = optim.Adam(solar_model.parameters(), lr=1e-3)
+solar_model.train()
+for epoch in range(10):
+    opt_solar_pre.zero_grad()
+    pred_gen, pred_rad = solar_model(X_jeju)
+    loss_total = criterion_mse(pred_rad, y_jeju_rad) + criterion_mse(pred_gen, y_jeju_gen)
+    loss_total.backward()
+    opt_solar_pre.step()
+print("태양광 모델 선학습 완료.")
+
+# ─────────────────────────────────────────────────────────
+# [STAGE 2] 태양광 모델 실제 데이터 Model A 파인튜닝 (Fine-tuning)
+# ─────────────────────────────────────────────────────────
+print("\n[STAGE 2] 실제 데이터(train.csv) 기반 태양광 Model A 파인튜닝...")
+for param in solar_model.model_b.parameters():
+    param.requires_grad = False # Stage B 고정
+
+opt_solar_fine = optim.Adam(solar_model.model_a.parameters(), lr=1e-5)
+X_train_solar = torch.tensor(train[solar_features].values, dtype=torch.float32)
+y_train_rad = torch.tensor(train['solar_radiation'].values, dtype=torch.float32).unsqueeze(1)
+
+solar_model.model_a.train()
+    
+for epoch in range(10):
+    opt_solar_fine.zero_grad()
+    _, pred_rad = solar_model(X_train_solar)
+    loss_fine = criterion_mse(pred_rad, y_train_rad)
+    loss_fine.backward()
+    opt_solar_fine.step()
+print("태양광 Model A 파인튜닝 및 최종 가중치 고정 완료.")
+torch.save(solar_model.state_dict(), 'solar_power_forecast.pth')
+
+# ─────────────────────────────────────────────────────────
+# [STAGE 3] 수요 예측 모델 비대칭 가중 손실함수 실제 학습
+# ─────────────────────────────────────────────────────────
+print("\n [STAGE 3] 비대칭 가중 손실함수를 적용한 수요 예측 모델 실제 학습 개시...")
+demand_model = DemandForecastModel(input_dim=12, hidden_dim=64)
+
+X_train_demand = torch.tensor(train[demand_features].values, dtype=torch.float32)
+y_train_demand = torch.tensor(train['power_consumption'].values, dtype=torch.float32).unsqueeze(1)
+
+# 비대칭 가중 손실함수 적용 (과소 예측 페널티 가중치 3.5 부여)
+criterion_asymmetric = AsymmetricWeightedMSE(alpha=3.0)
+opt_demand = optim.Adam(demand_model.parameters(), lr=1e-3)
+
+demand_model.train()
+for epoch in range(15): 
+    opt_demand.zero_grad()
+    pred_demand = demand_model(X_train_demand)
+
+    # 1. 학습은 블랙아웃 방지용 '비대칭 손실함수'로 진행
+    loss_demand = criterion_asymmetric(pred_demand, y_train_demand)
+    loss_demand.backward()
+    opt_demand.step()
+
+    # 2. 훈련 도중 실시간 성능 점검을 위해 sMAPE 점수 계산 
+    if epoch % 3 == 0:
+        # 텐서를 numpy로 변환하여 sMAPE 계산
+        preds_np = pred_demand.detach().cpu().numpy().flatten()
+        labels_np = y_train_demand.detach().cpu().numpy().flatten()
+        epoch_smape = calculate_smape(labels_np, preds_np)
+            
+        print(f"   Epoch {epoch}/15 - Asymmetric Loss: {loss_demand.item():.4f} | Train sMAPE: {epoch_smape:.2f}%")
+
+print("비대칭 가중 손실함수 기반 수요 예측 모델 학습 완료.")
+torch.save(demand_model.state_dict(), 'demand_forecast_model.pth')
+
+
+# 저장된 모델 불러오기
+solar_model = SolarPowerForecast(weather_time_dim=6, hidden_dim=64)
+if os.path.exists('solar_power_forecast.pth'):
+    solar_model.load_state_dict(torch.load('solar_power_forecast.pth'))
+solar_model.eval()
+
+demand_model = DemandForecastModel(input_dim=12, hidden_dim=64)
+if os.path.exists('demand_forecast_model.pth'):
+    demand_model.load_state_dict(torch.load('demand_forecast_model.pth'))
+demand_model.eval()
+
+# 3. 예측 결과를 담을 리스트 생성
+pred_demands = []
+pred_solars = []
+net_loads = []
+
+print("\n[Step 3] 실제 테스트셋 기반 조건부 순부하 추론 시작...")
+
+# 테스트셋 전체 데이터를 행 단위로 순회하며 예측
+for idx, row in test.iterrows():
+    # 피처 텐서 변환
+    solar_feats = torch.tensor([row['temperature'], row['humidity'], row['sin_hour'], row['cos_hour'], row['sin_month'], row['cos_month']], dtype=torch.float32).unsqueeze(0)
+    demand_feats = torch.tensor([row['temperature'], row['humidity'], row['windspeed'], row['THI'], row['CDH'], row['WCT'], row['sin_hour'], row['cos_hour'], row['sin_dayofweek'], row['cos_dayofweek'], row['building_mean'], row['building_std']], dtype=torch.float32).unsqueeze(0)
+
+    with torch.no_grad():
+       # (1) 공통 전력 수요 예측
+        pred_demand = demand_model(demand_feats).item()
+
+        # (2) 건물별 인프라 확인에 따른 조건부 태양광 발전 예측 분기
+        if row['solar_flag'] == 1:
+            pred_solar_eff, _ = solar_model(solar_feats)
+            # 효율 추정치에 해당 건물의 실제 설비 용량을 곱함
+            pred_solar = max(0, pred_solar_eff.item() * row['solar_power_capacity'])
+        else:
+            pred_solar = 0.0
+
+    # (3) 최종 실무 지표: 순부하(Net Load) 도출
+    net_load = max(0, pred_demand - pred_solar)
+
+    # 결과 저장
+    pred_demands.append(pred_demand)
+    pred_solars.append(pred_solar)
+    net_loads.append(net_load)
+
+    # 진행 상황 출력 (1000행마다 로그 출력)
+    if idx % 1000 == 0:
+        print(f"Progress: {idx}/{len(test)} 행 추론 완료...")
+
+# 4. 최종 결과 데이터프레임 구축 및 파일 내보내기
+test['pred_demand'] = pred_demands
+test['pred_solar'] = pred_solars
+test['net_load'] = net_loads
+
+# 필요한 컬럼만 추출하여 저장
+output_cols = ['building_number', 'date_time', 'pred_demand', 'pred_solar', 'net_load', 'solar_flag']
+final_submission = test[output_cols]
+
+output_path = f'{DATA_DIR}/final_net_load_prediction.csv'
+final_submission.to_csv(output_path, index=False, encoding='utf-8-sig')
+print(f"\n[완료] 실제 데이터 기반 최종 예측 결과가 성공적으로 저장되었습니다: {output_path}")
